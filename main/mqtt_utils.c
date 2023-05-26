@@ -1,14 +1,23 @@
+#include <stdbool.h>
 #include "mqtt_utils.h"
-#include "cJSON.h"
+#include "json.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
 
-esp_mqtt_client_handle_t client = NULL;
+esp_mqtt_client_handle_t client_ = NULL;
 extern const char *TAG;
+
+
 
 static char *getTopic(const char *topic) {
   static char topicBuff[NAME_MAX];
-  snprintf(topicBuff, NAME_MAX, "/topic/%s", topic);
+  snprintf(topicBuff, NAME_MAX, "/topic/%s/%s", CONFIG_DEVICE_ID, topic);
+  return topicBuff;
+}
+
+static char *getSysTopic(const char *topic) {
+  static char topicBuff[NAME_MAX];
+  snprintf(topicBuff, NAME_MAX, "/topic/system/%s", topic);
   return topicBuff;
 }
 
@@ -17,6 +26,25 @@ static void log_error_if_nonzero(const char *message, int error_code) {
     ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
   }
 }
+
+/**
+ * @brief Handle MQTT subscription reception...
+ * 
+ * @param topic Topic of message received
+ * @param msg Message data in null terminated string...
+ */
+static void on_topic_received(char *topic, char *msg) {
+  ESP_LOGI(TAG, "TOPIC=%s", topic);
+  ESP_LOGI(TAG, "DATA=%s", msg);
+}
+
+void subscribe_to_topics(esp_mqtt_client_handle_t client) {
+  int msg_id;
+
+  msg_id = esp_mqtt_client_subscribe(client, getTopic("control"), 0);
+  ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+}
+
 /*
  * @brief Event handler registered to receive MQTT events
  *
@@ -34,12 +62,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
            base, event_id);
   esp_mqtt_event_handle_t event = event_data;
   esp_mqtt_client_handle_t client = event->client;
-  int msg_id;
+  // int msg_id;
   switch ((esp_mqtt_event_id_t)event_id) {
   case MQTT_EVENT_CONNECTED:
-
-    msg_id = esp_mqtt_client_subscribe(client, getTopic(CONFIG_DEVICE_ID), 0);
-    ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+    subscribe_to_topics(client);
+    // msg_id = esp_mqtt_client_subscribe(client, getTopic(CONFIG_DEVICE_ID),
+    // 0); ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
 
     // msg_id = esp_mqtt_client_subscribe(client, "/topic/qos1", 1);
     // ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
@@ -62,8 +90,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     break;
   case MQTT_EVENT_DATA:
     ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-    printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
-    printf("DATA=%.*s\r\n", event->data_len, event->data);
+    {
+      // printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+      // printf("DATA=%.*s\r\n", event->data_len, event->data);
+      char *topic = NULL, *data = NULL;
+      topic = (char *)malloc(event->topic_len + 1);
+      data = (char *)malloc(event->data_len + 1);
+      memset(topic, 0, event->topic_len + 1);
+      memset(data, 0, event->data_len + 1);
+      strncpy(topic, event->topic, event->topic_len);
+      strncpy(data, event->data, event->data_len);
+      on_topic_received(topic, data);
+      free(topic);
+      free(data);
+    }
     break;
   case MQTT_EVENT_ERROR:
     ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
@@ -85,8 +125,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 }
 
 esp_mqtt_client_handle_t mqtt_app_start(void) {
+  const char *lwt_msg = create_connection_state_json(false);
+
   esp_mqtt_client_config_t mqtt_cfg = {
       .broker.address.uri = "mqtt://umansoft.ddns.net",
+      .session.keepalive = 30,
+      .session.last_will.topic = getSysTopic("connection"),
+      .session.last_will.msg = lwt_msg,
+      .session.last_will.msg_len = strlen(lwt_msg),
+      .session.last_will.retain = true,
+      .session.last_will.qos = 1,
   };
 
   esp_mqtt_client_handle_t my_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -96,45 +144,8 @@ esp_mqtt_client_handle_t mqtt_app_start(void) {
                                  mqtt_event_handler, NULL);
   esp_mqtt_client_start(my_client);
 
+  free((void *)lwt_msg);
   return my_client;
-}
-
-const char *create_led_state_json(const char *state, int delay) {
-  cJSON *json = NULL;
-  json = cJSON_CreateObject();
-  cJSON *control = cJSON_AddObjectToObject(json, "control");
-  if (cJSON_AddStringToObject(control, "led", state) == NULL) {
-    cJSON_Delete(json);
-    return NULL;
-  }
-  if (cJSON_AddNumberToObject(control, "delay", delay) == NULL) {
-    cJSON_Delete(json);
-    return NULL;
-  }
-
-  const char *state_json = cJSON_PrintUnformatted(json);
-
-  cJSON_Delete(json);
-  return state_json;
-}
-
-const char *create_connection_state_json(bool connected) {
-  cJSON *json = NULL;
-  json = cJSON_CreateObject();
-  cJSON *control = cJSON_AddObjectToObject(json, "connectivity");
-  if (cJSON_AddStringToObject(control, "deviceId", CONFIG_DEVICE_ID) == NULL) {
-    cJSON_Delete(json);
-    return NULL;
-  }
-  if (cJSON_AddBoolToObject(control, "connected", connected) == NULL) {
-    cJSON_Delete(json);
-    return NULL;
-  }
-
-  const char *state_json = cJSON_PrintUnformatted(json);
-
-  cJSON_Delete(json);
-  return state_json;
 }
 
 /**
@@ -144,21 +155,22 @@ const char *create_connection_state_json(bool connected) {
  * @param delay ms delay value
  */
 void publish_led_state(bool ledState, int delay) {
-  const char *led_json_blob =
+  char *led_json_blob =
       create_led_state_json(ledState ? "On" : "Off", CONFIG_BLINK_PERIOD);
-  esp_mqtt_client_publish(client, getTopic(CONFIG_DEVICE_ID), led_json_blob,
+  esp_mqtt_client_publish(client_, getTopic("status"), led_json_blob,
                           strlen(led_json_blob), 1, false);
+  free((void *)led_json_blob);
 }
 
 /**
- * @brief Send LED state to MQTT broker...
+ * @brief Send connection state to MQTT broker...
  *
- * @param ledState true/false indicating on/off status
- * @param delay ms delay value
+ * @param connected true/false indicating connection status
  */
 void publish_connection_state(bool connected) {
-  const char *connection_json_blob =
-      create_connection_state_json(connected);
-  esp_mqtt_client_publish(client, getTopic("connect"), connection_json_blob,
-                          strlen(connection_json_blob), 1, false);
+  char *connection_json_blob = create_connection_state_json(connected);
+  esp_mqtt_client_publish(client_, getSysTopic("connection"),
+                          connection_json_blob, strlen(connection_json_blob), 1,
+                          true);
+  free(connection_json_blob);
 }
